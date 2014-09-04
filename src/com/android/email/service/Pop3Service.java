@@ -40,6 +40,7 @@ import com.android.email2.ui.MailActivityEmail;
 import com.android.emailcommon.Logging;
 import com.android.emailcommon.TrafficFlags;
 import com.android.emailcommon.mail.AuthenticationFailedException;
+import com.android.emailcommon.mail.Flag;
 import com.android.emailcommon.mail.Folder.OpenMode;
 import com.android.emailcommon.mail.MessagingException;
 import com.android.emailcommon.provider.Account;
@@ -52,6 +53,7 @@ import com.android.emailcommon.provider.EmailContent.SyncColumns;
 import com.android.emailcommon.provider.Mailbox;
 import com.android.emailcommon.service.EmailServiceStatus;
 import com.android.emailcommon.service.IEmailServiceCallback;
+import com.android.emailcommon.service.SyncSize;
 import com.android.emailcommon.utility.AttachmentUtilities;
 import com.android.mail.providers.UIProvider;
 import com.android.mail.providers.UIProvider.AttachmentState;
@@ -66,33 +68,33 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import android.util.Log;
+
+import android.text.TextUtils;
 
 public class Pop3Service extends Service {
     private static final String TAG = "Pop3Service";
     private static final int DEFAULT_SYNC_COUNT = 100;
-    private static final String ACTION_CHECK_MAIL = "com.android.email.intent.action.MAIL_SERVICE_WAKEUP";
-    private static final String EXTRA_ACCOUNT = "com.android.email.intent.extra.ACCOUNT";
-    private static final String EXTRA_MSGID = "com.android.email.intent.extra.MSGID";
+
+    private static final String ACTION_CHECK_MAIL =
+            "com.android.email.intent.action.MAIL_SERVICE_WAKEUP";
+    private static final String EXTRA_ACCOUNT =
+            "com.android.email.intent.extra.ACCOUNT";
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        final String action = intent.getAction();
+        LogUtils.d(TAG, "Start with command, action: " + action);
+        Context context = getApplicationContext();
+        if (ACTION_CHECK_MAIL.equals(action)) {
+            final long accountId = intent.getLongExtra(EXTRA_ACCOUNT, -1);
+            final long inboxId = Mailbox.findMailboxOfType(context, accountId,
+                    Mailbox.TYPE_INBOX);
+            LogUtils.d(TAG, "account id is: " + accountId + ", inbox id is: " + inboxId);
+            mBinder.init(context);
+            mBinder.requestSync(inboxId, true, 0);
+        }
 
-           Log.d(TAG,"Inside onStartCommand");
-           final String action = intent.getAction();
-           Log.d(TAG,"action is " + action);
-           Context context = getApplicationContext();
-           if (ACTION_CHECK_MAIL.equals(action)) {
-               final long accountId = intent.getLongExtra(EXTRA_ACCOUNT, -1);
-               Log.d(TAG,"accountId is " + accountId);
-               final long inboxId = Mailbox.findMailboxOfType(context, accountId,
-                          Mailbox.TYPE_INBOX);
-               Log.d(TAG,"inboxId is " + inboxId);
-               mBinder.init(context);
-               mBinder.requestSync(inboxId,true,0);
-           }
-
-           return Service.START_STICKY;
+        return Service.START_STICKY;
     }
 
     /**
@@ -132,6 +134,56 @@ public class Pop3Service extends Service {
             if (inboxId == Mailbox.NO_MAILBOX) return;
             // We load attachments during a sync
             requestSync(inboxId, true, 0);
+        }
+
+        @Override
+        public void loadMore(long messageId) throws RemoteException {
+            LogUtils.i(TAG, "Try to load more content for message: " + messageId);
+            try {
+                final Message message = Message.restoreMessageWithId(mContext, messageId);
+                if (message == null || message.mFlagLoaded == Message.FLAG_LOADED_COMPLETE) {
+                    return;
+                }
+
+                // Open the remote folder.
+                final Account account = Account.restoreAccountWithId(mContext, message.mAccountKey);
+                final Mailbox mailbox = Mailbox.restoreMailboxWithId(mContext, message.mMailboxKey);
+                if (account == null || mailbox == null) {
+                    return;
+                }
+                TrafficStats.setThreadStatsTag(TrafficFlags.getSyncFlags(mContext, account));
+
+                final Pop3Store remoteStore = (Pop3Store) Store.getInstance(account, mContext);
+                final String remoteServerId;
+                // If this is a search result, use the protocolSearchInfo field to get the
+                // correct remote location
+                if (!TextUtils.isEmpty(message.mProtocolSearchInfo)) {
+                    remoteServerId = message.mProtocolSearchInfo;
+                } else {
+                    remoteServerId = mailbox.mServerId;
+                }
+                final Pop3Folder remoteFolder = (Pop3Folder) remoteStore.getFolder(remoteServerId);
+                remoteFolder.open(OpenMode.READ_WRITE);
+
+                // Download the entire message
+                final Pop3Message remoteMessage = (Pop3Message) remoteFolder
+                        .getMessage(message.mServerId);
+                remoteFolder.fetchBody(remoteMessage, -1 /* entire mail */, null);
+
+                if (message.mFlagSeen) {
+                    // Set the SEEN flag to this message as it must be read.
+                    remoteMessage.setFlag(Flag.SEEN, true);
+                }
+                // Store the updated message locally and mark it fully loaded
+                Utilities.copyOneMessageToProvider(mContext, remoteMessage, account, mailbox,
+                        EmailContent.Message.FLAG_LOADED_COMPLETE);
+            } catch (MessagingException me) {
+                LogUtils.d(Logging.LOG_TAG, "Pop3Service loadMore: ", me);
+            } catch (RuntimeException rte) {
+                LogUtils.d(Logging.LOG_TAG, "Pop3Service loadMore: ", rte);
+            } catch (IOException ioe) {
+                LogUtils.d(Logging.LOG_TAG, "Pop3Service loadMore: ", ioe);
+            }
         }
     };
 
@@ -223,7 +275,18 @@ public class Pop3Service extends Service {
             // They are in most recent to least recent order, process them that way.
             for (int i = 0; i < cnt; i++) {
                 final Pop3Message message = unsyncedMessages.get(i);
-                remoteFolder.fetchBody(message, getFetchBodySize(context, account), null);
+
+                // Get the sync lines of this account's message.
+                int allowSyncLines = -1;
+                if (account.isSetSyncSizeEnabled()) {
+                    if (account.getSyncSize() != SyncSize.SYNC_SIZE_ENTIRE_MAIL) {
+                        allowSyncLines = account.getSyncSize() / 76;
+                    }
+                } else {
+                    allowSyncLines = Pop3Store.FETCH_BODY_SANE_SUGGESTED_SIZE / 76;
+                }
+
+                remoteFolder.fetchBody(message, allowSyncLines, null);
                 int flag = EmailContent.Message.FLAG_LOADED_COMPLETE;
                 if (!message.isComplete()) {
                     // TODO: when the message is not complete, this should mark the message as
@@ -231,7 +294,7 @@ public class Pop3Service extends Service {
                     // 1) Partial messages are shown in the conversation list
                     // 2) We are able to download the rest of the message/attachment when the
                     //    user requests it.
-                     flag = EmailContent.Message.FLAG_LOADED_PARTIAL;
+                     flag = EmailContent.Message.FLAG_LOADED_PARTIAL_COMPLETE;
                 }
                 if (MailActivityEmail.DEBUG) {
                     LogUtils.d(TAG, "Message is " + (message.isComplete() ? "" : "NOT ")
@@ -333,7 +396,8 @@ public class Pop3Service extends Service {
                     // Delete this on the server
                     Pop3Message popMessage =
                             (Pop3Message)remoteFolder.getMessage(currentMsg.mServerId);
-                    if (popMessage != null) {
+                    if (popMessage != null &&
+                            account.getDeletePolicy() != Account.DELETE_POLICY_NEVER) {
                         remoteFolder.deleteMessage(popMessage);
                     }
                 }
@@ -411,7 +475,7 @@ public class Pop3Service extends Service {
                 // localMessage == null -> message has never been created (not even headers)
                 // mFlagLoaded != FLAG_LOADED_COMPLETE -> message failed to sync completely
                 if (localMessage == null ||
-                        (localMessage.mFlagLoaded != EmailContent.Message.FLAG_LOADED_COMPLETE &&
+                        (localMessage.mFlagLoaded != Message.FLAG_LOADED_COMPLETE &&
                                 localMessage.mFlagLoaded != Message.FLAG_LOADED_PARTIAL)) {
                     LogUtils.d(Logging.LOG_TAG, "need to sync " + uid);
                     unsyncedMessages.add(message);
